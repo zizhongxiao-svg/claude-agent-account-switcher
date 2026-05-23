@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+DEFAULT_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+SENSITIVE_LINE_RE = re.compile(
+    r"(\.credentials|\.git-credentials|sls_credentials|refresh_token|access_token|api[_-]?key|secret)",
+    re.IGNORECASE,
+)
+SENSITIVE_ASSIGN_RE = re.compile(
+    r"(?i)(refresh_token|access_token|api[_-]?key|secret)\s*[:=]\s*['\"]?[^'\"\\s,;}]+"
+)
+SENSITIVE_PATH_RE = re.compile(
+    r"(?i)\S*(?:\.credentials(?:\.json)?|\.git-credentials|sls_credentials)\S*"
+)
+
+
+def run_text(cmd, cwd=None, env=None):
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def load_live_agents(config_dir):
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    code, stdout, stderr = run_text(["claude", "agents", "--json"], env=env)
+    if code != 0:
+        raise RuntimeError(stderr.strip() or "claude agents --json failed")
+    try:
+        agents = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"failed to parse claude agents --json output: {exc}") from exc
+    if not isinstance(agents, list):
+        raise RuntimeError("claude agents --json did not return a list")
+    return agents
+
+
+def slug(value, fallback):
+    raw = (value or fallback or "agent").strip().lower()
+    raw = SAFE_NAME_RE.sub("-", raw).strip("-._")
+    return raw[:48] or fallback
+
+
+def redact(text):
+    if not text:
+        return text
+    filtered = []
+    for line in str(text).splitlines():
+        if SENSITIVE_LINE_RE.search(line):
+            line = SENSITIVE_ASSIGN_RE.sub("[redacted-sensitive-value]", line)
+            line = SENSITIVE_PATH_RE.sub("[redacted-sensitive-path]", line)
+            if SENSITIVE_LINE_RE.search(line):
+                continue
+            if not line.strip():
+                continue
+        filtered.append(line)
+    return "\n".join(filtered)
+
+
+def project_dir_name(cwd):
+    return str(cwd).replace("/", "-")
+
+
+def find_session_jsonl(config_dir, agent):
+    session_id = agent.get("sessionId")
+    if not session_id:
+        return None
+    cwd = agent.get("cwd")
+    candidates = []
+    if cwd:
+        candidates.append(config_dir / "projects" / project_dir_name(cwd) / f"{session_id}.jsonl")
+    candidates.extend((config_dir / "projects").glob(f"**/{session_id}.jsonl"))
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def tail_lines(path, limit):
+    if not path or not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    return [line.rstrip("\n") for line in lines[-limit:]]
+
+
+def compact_jsonl(lines):
+    chunks = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item_type = item.get("type", "unknown")
+        timestamp = item.get("timestamp", "")
+        message = item.get("message")
+        text = ""
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(str(part.get("text", part)) for part in content if isinstance(part, dict))
+            else:
+                text = str(content)
+        elif "content" in item:
+            text = str(item.get("content", ""))
+        elif item_type == "system":
+            text = item.get("subtype", "")
+        if not text:
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        text = redact(text)
+        if not text:
+            continue
+        chunks.append(f"[{timestamp}] {item_type}: {text[:4000]}")
+    return "\n\n".join(chunks)
+
+
+def load_job_state(config_dir, session_id):
+    if not session_id:
+        return None, None
+    short = session_id.split("-")[0]
+    state_path = config_dir / "jobs" / short / "state.json"
+    if not state_path.exists():
+        return None, None
+    try:
+        return state_path, json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return state_path, None
+
+
+def git_snapshot(cwd, max_chars):
+    cwd_path = Path(cwd or ".")
+    if not cwd_path.exists():
+        return "cwd is not available on disk."
+    code, top, _ = run_text(["git", "rev-parse", "--show-toplevel"], cwd=str(cwd_path))
+    if code != 0:
+        return "cwd is not inside a git repository."
+    repo = top.strip()
+    parts = []
+    for label, cmd in [
+        ("branch", ["git", "branch", "--show-current"]),
+        ("status", ["git", "status", "--short"]),
+        ("diff --stat", ["git", "diff", "--stat"]),
+    ]:
+        code, stdout, stderr = run_text(cmd, cwd=repo)
+        body = stdout.strip() if code == 0 else stderr.strip()
+        parts.append(f"### {label}\n{redact(body) or '(empty)'}")
+    result = "\n\n".join(parts)
+    if len(result) > max_chars:
+        return result[:max_chars] + "\n\n[truncated]"
+    return result
+
+
+def write_handoff(out_dir, config_dir, agent, tail_limit, include_git):
+    session_id = agent.get("sessionId", "unknown")
+    short = session_id.split("-")[0]
+    name = agent.get("name") or short
+    file_name = f"{short}-{slug(name, short)}.md"
+    session_path = find_session_jsonl(config_dir, agent)
+    job_path, job = load_job_state(config_dir, session_id)
+    recent = compact_jsonl(tail_lines(session_path, tail_limit))
+    git_info = git_snapshot(agent.get("cwd"), 12000) if include_git else "skipped by --no-git"
+
+    job_summary = "(no job state found)"
+    original_intent = ""
+    if isinstance(job, dict):
+        safe_job = {
+            key: job.get(key)
+            for key in [
+                "state",
+                "detail",
+                "needs",
+                "intent",
+                "name",
+                "cwd",
+                "originCwd",
+                "updatedAt",
+                "resumeSessionId",
+                "respawnFlags",
+            ]
+            if key in job
+        }
+        job_summary = redact(json.dumps(safe_job, ensure_ascii=False, indent=2))
+        original_intent = str(job.get("intent") or "")
+
+    body = f"""# Claude Agent Handoff: {name}
+
+You are continuing work from a previous Claude Code Agent View task that was exported as a handoff pack.
+
+## Continue This Task
+
+Pick up the task below from the exported context. First inspect the working tree in `cwd`, then continue from the latest state. Do not assume the previous agent completed anything unless the files, git diff, command output, or live service state proves it.
+
+## Agent Metadata
+
+- name: {name}
+- source session: {session_id}
+- source status: {agent.get("status", "")}
+- source kind: {agent.get("kind", "")}
+- source cwd: {agent.get("cwd", "")}
+- source pid: {agent.get("pid", "")}
+- exported from config: {config_dir}
+- session log: {session_path or "(not found)"}
+- job state: {job_path or "(not found)"}
+
+## Original Intent
+
+{original_intent or "(not available)"}
+
+## Job State Snapshot
+
+```json
+{job_summary}
+```
+
+## Git Snapshot
+
+```text
+{git_info}
+```
+
+## Recent Conversation Tail
+
+```text
+{recent or "(no recent conversation content found)"}
+```
+
+## Operating Instructions
+
+- Treat this as a continuation, not as proof of completion.
+- Re-check files and runtime state before making claims.
+- Preserve unrelated user changes in the working tree.
+- If the source task was blocked by quota, continue normally under this account.
+"""
+    path = out_dir / file_name
+    path.write_text(body, encoding="utf-8")
+    return path, session_path, job_path
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Export current Claude Code Agent View live sessions into handoff prompts."
+    )
+    parser.add_argument("--config-dir", default=str(DEFAULT_CONFIG_DIR), help="Source Claude config dir.")
+    parser.add_argument("--output-dir", help="Output directory. Default: ~/claude-handoffs/<timestamp>")
+    parser.add_argument("--tail-lines", type=int, default=120, help="Session JSONL tail lines to include per task.")
+    parser.add_argument("--no-git", action="store_true", help="Skip git status/diff snapshots.")
+    parser.add_argument("--status", help="Comma-separated status filter, e.g. idle,waiting,blocked.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
+    config_dir = Path(args.config_dir).expanduser().resolve()
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(args.output_dir or Path.home() / "claude-handoffs" / timestamp).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    agents = load_live_agents(config_dir)
+    statuses = None
+    if args.status:
+        statuses = {part.strip() for part in args.status.split(",") if part.strip()}
+        agents = [agent for agent in agents if agent.get("status") in statuses]
+
+    exported = []
+    for agent in agents:
+        prompt_path, session_path, job_path = write_handoff(
+            out_dir,
+            config_dir,
+            agent,
+            args.tail_lines,
+            not args.no_git,
+        )
+        exported.append((agent, prompt_path, session_path, job_path))
+
+    index_lines = [
+        "# Claude Agent Handoff Pack",
+        "",
+        f"- exported_at: {datetime.now().isoformat(timespec='seconds')}",
+        f"- source_config_dir: {config_dir}",
+        f"- agent_count: {len(exported)}",
+        f"- status_filter: {','.join(sorted(statuses)) if statuses else '(none)'}",
+        "",
+        "## Continue From Another Account",
+        "",
+        "Open `c1a` or `c2a`, create a new agent, and paste the matching handoff prompt file content.",
+        "These files are continuation prompts; they do not migrate running processes.",
+        "",
+        "## Tasks",
+        "",
+    ]
+    for agent, prompt_path, session_path, job_path in exported:
+        index_lines.extend(
+            [
+                f"- [{agent.get('name') or agent.get('sessionId')}]({prompt_path.name})",
+                f"  - status: {agent.get('status', '')}",
+                f"  - cwd: {agent.get('cwd', '')}",
+                f"  - session: {agent.get('sessionId', '')}",
+                f"  - session_log: {session_path or '(not found)'}",
+                f"  - job_state: {job_path or '(not found)'}",
+            ]
+        )
+    (out_dir / "INDEX.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+    print(f"Exported {len(exported)} agent handoff(s) to {out_dir}")
+    print(f"Index: {out_dir / 'INDEX.md'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

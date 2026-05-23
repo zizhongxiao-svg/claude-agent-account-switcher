@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Never commit local Claude state or exported handoff packs.
+.claude/
+.claude-*/
+claude-handoffs/
+freeze-import-registry/
+*.credentials*
+.credentials.json
+.git-credentials
+*token*
+*secret*

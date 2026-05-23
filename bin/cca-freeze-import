@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+TARGETS = {
+    "c1": Path("~/.claude-c1").expanduser(),
+    "c2": Path("~/.claude-c2").expanduser(),
+    "cc": Path("~/.claude").expanduser(),
+    "cca": Path("~/.claude").expanduser(),
+}
+
+
+def run_text(cmd, env=None):
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def load_agents(source_config):
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = str(source_config)
+    code, stdout, stderr = run_text(["claude", "agents", "--json"], env=env)
+    if code != 0:
+        raise RuntimeError(stderr.strip() or "claude agents --json failed")
+    data = json.loads(stdout)
+    if not isinstance(data, list):
+        raise RuntimeError("claude agents --json did not return a list")
+    return data
+
+
+def load_static_job_agents(source_config):
+    agents = []
+    for state_path in sorted((source_config / "jobs").glob("*/state.json")):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        session_id = state.get("resumeSessionId") or state.get("sessionId")
+        if not session_id:
+            link_scan = state.get("linkScanPath")
+            if link_scan:
+                session_id = Path(link_scan).stem
+        if not session_id:
+            continue
+        agents.append(
+            {
+                "pid": "",
+                "cwd": state.get("cwd") or state.get("originCwd") or str(Path.home()),
+                "kind": "static-job",
+                "sessionId": session_id,
+                "name": state.get("name") or state_path.parent.name,
+                "status": state.get("state") or "static",
+                "_staticJobStatePath": str(state_path),
+                "_linkScanPath": state.get("linkScanPath"),
+            }
+        )
+    return agents
+
+
+def merge_agents(live_agents, static_agents):
+    merged = {}
+    for agent in static_agents:
+        sid = agent.get("sessionId")
+        if sid:
+            merged[sid] = agent
+    for agent in live_agents:
+        sid = agent.get("sessionId")
+        if sid:
+            merged[sid] = agent
+    return list(merged.values())
+
+
+def project_dir_name(cwd):
+    return str(cwd).replace("/", "-")
+
+
+def find_session_jsonl(config_dir, agent):
+    session_id = agent.get("sessionId")
+    if not session_id:
+        return None
+    link_scan = agent.get("_linkScanPath")
+    if link_scan:
+        link_path = Path(link_scan)
+        if link_path.exists() and link_path.is_file():
+            return link_path
+    candidates = []
+    cwd = agent.get("cwd")
+    if cwd:
+        candidates.append(config_dir / "projects" / project_dir_name(cwd) / f"{session_id}.jsonl")
+    candidates.extend((config_dir / "projects").glob(f"**/{session_id}.jsonl"))
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def copy_file_preserve_rel(source_config, target_config, source_path, force=False):
+    rel = source_path.relative_to(source_config)
+    dest = target_config / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and not force:
+        return dest, "exists"
+    shutil.copy2(source_path, dest)
+    return dest, "copied"
+
+
+def copy_job_dir(source_config, target_config, short_id, force=False):
+    source_dir = source_config / "jobs" / short_id
+    if not source_dir.exists():
+        return [], "missing"
+    copied = []
+    for source_path in source_dir.glob("*"):
+        if source_path.is_file():
+            dest, status = copy_file_preserve_rel(source_config, target_config, source_path, force=force)
+            copied.append((dest, status))
+    return copied, "copied"
+
+
+def source_registry_path(target_config, source_config):
+    key = hashlib.sha1(str(source_config).encode("utf-8")).hexdigest()[:16]
+    return target_config / "freeze-import-registry" / f"{key}.json"
+
+
+def is_within(path, root):
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def remove_empty_parents(path, stop_at):
+    current = path.parent
+    stop_at = stop_at.resolve()
+    while is_within(current, stop_at) and current != stop_at:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def replace_previous_source_import(target_config, source_config):
+    registry = source_registry_path(target_config, source_config)
+    if not registry.exists():
+        return 0
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    removed = 0
+    for entry in data.get("entries", []):
+        for key in ("session_dest", "job_files"):
+            values = entry.get(key)
+            if not values:
+                continue
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                path = Path(value)
+                if not is_within(path, target_config) or "sessions" in path.parts:
+                    continue
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    removed += 1
+                    remove_empty_parents(path, target_config)
+    return removed
+
+
+def replace_all_imported_context(target_config):
+    registry_dir = target_config / "freeze-import-registry"
+    if not registry_dir.exists():
+        return 0
+    removed = 0
+    for registry in sorted(registry_dir.glob("*.json")):
+        try:
+            data = json.loads(registry.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for entry in data.get("entries", []):
+            for key in ("session_dest", "job_files"):
+                values = entry.get(key)
+                if not values:
+                    continue
+                if isinstance(values, str):
+                    values = [values]
+                for value in values:
+                    path = Path(value)
+                    if not is_within(path, target_config) or "sessions" in path.parts:
+                        continue
+                    if path.exists() and path.is_file():
+                        path.unlink()
+                        removed += 1
+                        remove_empty_parents(path, target_config)
+        try:
+            registry.unlink()
+        except OSError:
+            pass
+    try:
+        registry_dir.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def write_source_registry(target_config, source_config, imported):
+    registry = source_registry_path(target_config, source_config)
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for item in imported:
+        entries.append(
+            {
+                "sessionId": item["agent"].get("sessionId"),
+                "name": item["agent"].get("name"),
+                "session_dest": item.get("session_dest"),
+                "job_files": item.get("job_files", []),
+            }
+        )
+    registry.write_text(
+        json.dumps(
+            {
+                "source_config": str(source_config),
+                "target_config": str(target_config),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "entries": entries,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return registry
+
+
+def write_latest_marker(source_config, target_config, target_label, imported):
+    marker = Path.home() / ".claude-freeze-current.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "source_config": str(source_config),
+                "target_config": str(target_config),
+                "target": target_label,
+                "imported_count": len(imported),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Freeze-import Claude Agent View history/jobs from one account config into another."
+    )
+    parser.add_argument("--source-config", default="~/.claude", help="Source Claude config dir, default ~/.claude.")
+    parser.add_argument("--target", choices=sorted(TARGETS), default="c1", help="Target shortcut, default c1.")
+    parser.add_argument("--target-config", help="Explicit target Claude config dir.")
+    parser.add_argument("--output-dir", help="Where to write import index and resume script.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing target history/job files.")
+    parser.add_argument(
+        "--replace-source",
+        dest="replace_source",
+        action="store_true",
+        default=False,
+        help="Before importing, remove files previously imported from the same source config.",
+    )
+    parser.add_argument(
+        "--no-replace-source",
+        dest="replace_source",
+        action="store_false",
+        help="Append imported context without removing the previous import from the same source config.",
+    )
+    parser.add_argument(
+        "--replace-target",
+        dest="replace_target",
+        action="store_true",
+        default=True,
+        help="Before importing, remove all files previously created by freeze-import in the target config. This is the default.",
+    )
+    parser.add_argument(
+        "--no-replace-target",
+        dest="replace_target",
+        action="store_false",
+        help="Keep previous freeze-imported context in the target config.",
+    )
+    parser.add_argument("--status", help="Comma-separated source agent status filter.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
+    source_config = Path(args.source_config).expanduser().resolve()
+    target_config = Path(args.target_config).expanduser().resolve() if args.target_config else TARGETS[args.target].resolve()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(args.output_dir or Path.home() / "claude-handoffs" / f"freeze-import-{args.target}-{stamp}").expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.replace_target:
+        removed_previous = replace_all_imported_context(target_config)
+    else:
+        removed_previous = replace_previous_source_import(target_config, source_config) if args.replace_source else 0
+
+    agents = merge_agents(load_agents(source_config), load_static_job_agents(source_config))
+    statuses = None
+    if args.status:
+        statuses = {part.strip() for part in args.status.split(",") if part.strip()}
+        agents = [agent for agent in agents if agent.get("status") in statuses]
+
+    imported = []
+    for agent in agents:
+        session_id = agent.get("sessionId")
+        if not session_id:
+            continue
+        short = session_id.split("-")[0]
+        session_path = find_session_jsonl(source_config, agent)
+        session_dest = None
+        session_status = "missing"
+        if session_path:
+            session_dest, session_status = copy_file_preserve_rel(
+                source_config, target_config, session_path, force=args.force
+            )
+        job_copies, job_status = copy_job_dir(source_config, target_config, short, force=args.force)
+        imported.append(
+            {
+                "agent": agent,
+                "session_source": str(session_path) if session_path else None,
+                "session_dest": str(session_dest) if session_dest else None,
+                "session_status": session_status,
+                "job_status": job_status,
+                "job_files": [str(path) for path, _ in job_copies],
+            }
+        )
+
+    registry = write_source_registry(target_config, source_config, imported)
+    marker = write_latest_marker(source_config, target_config, args.target, imported)
+
+    target_label = args.target if not args.target_config else "target"
+    resume_script = out_dir / f"resume-{target_label}.sh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "# Run one command at a time if you want to inspect each resumed task.",
+        "# These commands fork from the imported static history under the target account.",
+        "",
+    ]
+    for item in imported:
+        agent = item["agent"]
+        cwd = agent.get("cwd") or str(Path.home())
+        sid = agent.get("sessionId")
+        name = agent.get("name") or sid
+        lines.append(f"echo '=== {name} ==='")
+        lines.append(
+            "cd "
+            + shell_quote(cwd)
+            + " && CLAUDE_CONFIG_DIR="
+            + shell_quote(target_config)
+            + " claude --resume "
+            + shell_quote(sid)
+            + " --fork-session"
+        )
+        lines.append("")
+    resume_script.write_text("\n".join(lines), encoding="utf-8")
+    resume_script.chmod(0o755)
+
+    index = out_dir / "INDEX.md"
+    index_lines = [
+        "# Claude Freeze Import",
+        "",
+        f"- source_config: {source_config}",
+        f"- target_config: {target_config}",
+        f"- imported_count: {len(imported)}",
+        f"- status_filter: {','.join(sorted(statuses)) if statuses else '(none)'}",
+        f"- replace_source: {args.replace_source}",
+        f"- replace_target: {args.replace_target}",
+        f"- removed_previous_files: {removed_previous}",
+        f"- registry: {registry}",
+        f"- latest_marker: {marker}",
+        "",
+        "This copied static `projects` history and `jobs` state only.",
+        "It intentionally did not copy `sessions`, daemon files, locks, or credentials.",
+        "",
+        f"Resume script: `{resume_script}`",
+        "",
+        "## Imported Tasks",
+        "",
+    ]
+    for item in imported:
+        agent = item["agent"]
+        index_lines.extend(
+            [
+                f"- {agent.get('name') or agent.get('sessionId')}",
+                f"  - status: {agent.get('status', '')}",
+                f"  - cwd: {agent.get('cwd', '')}",
+                f"  - session: {agent.get('sessionId', '')}",
+                f"  - session_copy: {item['session_status']} -> {item['session_dest']}",
+                f"  - job_status: {item['job_status']}",
+            ]
+        )
+    index.write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+
+    print(f"Imported {len(imported)} static agent context(s) into {target_config}")
+    print(f"Index: {index}")
+    print(f"Resume script: {resume_script}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

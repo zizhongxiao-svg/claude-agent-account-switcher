@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+
+CONFIGS = [
+    ("cc", Path("~/.claude").expanduser()),
+    ("c1", Path("~/.claude-c1").expanduser()),
+    ("c2", Path("~/.claude-c2").expanduser()),
+]
+
+
+def latest_mtime(config):
+    newest = 0.0
+    newest_path = None
+    patterns = [
+        "projects/**/*.jsonl",
+        "jobs/**/*.jsonl",
+        "jobs/**/*.json",
+        "sessions/*.json",
+        "freeze-import-registry/*.json",
+    ]
+    for pattern in patterns:
+        for path in config.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest:
+                newest = mtime
+                newest_path = path
+    return newest, newest_path
+
+
+def fmt_time(ts):
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_marker():
+    path = Path.home() / ".claude-freeze-current.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def live_count(config):
+    sessions = config / "sessions"
+    if not sessions.exists():
+        return 0
+    count = 0
+    for path in sessions.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pid = data.get("pid")
+        if pid and Path(f"/proc/{pid}").exists():
+            count += 1
+    return count
+
+
+def main():
+    rows = []
+    for label, config in CONFIGS:
+        mtime, path = latest_mtime(config)
+        rows.append((mtime, label, config, path, live_count(config)))
+    rows.sort(reverse=True, key=lambda row: row[0])
+
+    marker = load_marker()
+    if marker:
+        print(
+            "last freeze-import: "
+            f"{marker.get('source_config')} -> {marker.get('target')} "
+            f"at {marker.get('updated_at')} ({marker.get('imported_count')} tasks)"
+        )
+    else:
+        print("last freeze-import: -")
+    print("")
+    print("latest filesystem activity:")
+    for idx, (mtime, label, config, path, count) in enumerate(rows, start=1):
+        prefix = "*" if idx == 1 else " "
+        rel = "-"
+        if path:
+            try:
+                rel = str(path.relative_to(config))
+            except ValueError:
+                rel = str(path)
+        print(f"{prefix} {label:<2} {fmt_time(mtime)} live={count:<2} {config}  {rel}")
+    print("")
+    if rows and rows[0][0]:
+        print(f"likely latest account: {rows[0][1]}")
+
+
+if __name__ == "__main__":
+    main()
