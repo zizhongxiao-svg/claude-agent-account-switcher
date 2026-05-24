@@ -125,6 +125,68 @@ def test_import_includes_static_jobs_not_visible_as_live_agents():
         shutil.rmtree(root)
 
 
+def test_import_preserves_job_dir_when_live_agent_uses_resume_session():
+    root = Path(tempfile.mkdtemp(prefix="cca-freeze-import-resume-job-test-"))
+    try:
+        source = root / "source"
+        target = root / "target"
+        out = root / "out"
+        fake_claude = root / "bin" / "claude"
+        fake_claude.parent.mkdir(parents=True)
+
+        original_sid = "88888888-8888-4888-8888-888888888888"
+        resume_sid = "99999999-9999-4999-8999-999999999999"
+        fake_claude.write_text(
+            "#!/usr/bin/env bash\n"
+            "cat <<'JSON'\n"
+            "[{\"pid\":222,\"cwd\":\"%s/work\",\"kind\":\"background\","
+            "\"sessionId\":\"%s\",\"name\":\"resumed task\",\"status\":\"idle\"}]\n"
+            "JSON\n" % (str(root), resume_sid),
+            encoding="utf-8",
+        )
+        fake_claude.chmod(0o755)
+
+        rel_project = Path("projects") / "-tmp-resume-work" / f"{resume_sid}.jsonl"
+        write(source / rel_project, '{"type":"user","message":{"content":"resumed import"}}\n')
+        write(
+            source / "jobs" / "88888888" / "state.json",
+            json.dumps(
+                {
+                    "state": "blocked",
+                    "name": "resumed task",
+                    "sessionId": original_sid,
+                    "resumeSessionId": resume_sid,
+                    "cwd": str(root / "resume-work"),
+                    "linkScanPath": str(source / rel_project),
+                }
+            ),
+        )
+
+        env = os.environ.copy()
+        env["PATH"] = str(fake_claude.parent) + os.pathsep + env["PATH"]
+        result = run(
+            [
+                str(SCRIPT),
+                "--source-config",
+                str(source),
+                "--target-config",
+                str(target),
+                "--output-dir",
+                str(out),
+                "--force",
+            ],
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (target / rel_project).exists()
+        assert (target / "jobs" / "88888888" / "state.json").exists()
+        assert not (target / "jobs" / "99999999" / "state.json").exists()
+        state = json.loads((target / "jobs" / "88888888" / "state.json").read_text(encoding="utf-8"))
+        assert state["linkScanPath"] == str(target / rel_project)
+    finally:
+        shutil.rmtree(root)
+
+
 def test_replace_source_removes_previous_import_and_overwrites_existing_session():
     root = Path(tempfile.mkdtemp(prefix="cca-freeze-import-replace-test-"))
     try:
@@ -261,9 +323,66 @@ def test_default_import_removes_previous_imports_from_other_sources():
         shutil.rmtree(root)
 
 
+def test_reset_target_static_moves_native_context_before_import():
+    root = Path(tempfile.mkdtemp(prefix="cca-freeze-import-reset-test-"))
+    try:
+        source = root / "source"
+        target = root / "target"
+        out = root / "out"
+        fake_claude = root / "bin" / "claude"
+        fake_claude.parent.mkdir(parents=True)
+        fake_claude.write_text("#!/usr/bin/env bash\nprintf '[]\\n'\n", encoding="utf-8")
+        fake_claude.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = str(fake_claude.parent) + os.pathsep + env["PATH"]
+
+        sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        rel_new = Path("projects") / "-tmp-new" / f"{sid}.jsonl"
+        write(source / rel_new, "new\n")
+        write(source / "jobs" / "aaaaaaaa" / "state.json", json.dumps({"sessionId": sid, "cwd": str(root / "new")}))
+
+        write(target / "projects" / "-tmp-old" / "old.jsonl", "old\n")
+        write(target / "jobs" / "oldjob" / "state.json", "{}\n")
+        write(target / "freeze-import-registry" / "old.json", "{}\n")
+        write(target / "sessions" / "keep.json", "{}\n")
+
+        result = run(
+            [
+                str(SCRIPT),
+                "--source-config",
+                str(source),
+                "--target-config",
+                str(target),
+                "--output-dir",
+                str(out),
+                "--reset-target-static",
+                "--force",
+            ],
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (target / rel_new).exists()
+        assert (target / "jobs" / "aaaaaaaa" / "state.json").exists()
+        assert not (target / "projects" / "-tmp-old" / "old.jsonl").exists()
+        assert not (target / "jobs" / "oldjob" / "state.json").exists()
+        assert (target / "sessions" / "keep.json").exists()
+        backup_roots = list((target / "backups").glob("freeze-import-reset-*"))
+        assert len(backup_roots) == 1
+        backup = backup_roots[0]
+        assert (backup / "projects" / "-tmp-old" / "old.jsonl").exists()
+        assert (backup / "jobs" / "oldjob" / "state.json").exists()
+        index = (out / "INDEX.md").read_text(encoding="utf-8")
+        assert "reset_target_static: True" in index
+        assert "target_static_backup:" in index
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     test_import_copies_history_and_jobs_but_not_sessions()
     test_import_includes_static_jobs_not_visible_as_live_agents()
+    test_import_preserves_job_dir_when_live_agent_uses_resume_session()
     test_replace_source_removes_previous_import_and_overwrites_existing_session()
     test_default_import_removes_previous_imports_from_other_sources()
+    test_reset_target_static_moves_native_context_before_import()
     print("ok")

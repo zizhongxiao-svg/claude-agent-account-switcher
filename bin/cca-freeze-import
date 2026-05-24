@@ -63,6 +63,7 @@ def load_static_job_agents(source_config):
                 "sessionId": session_id,
                 "name": state.get("name") or state_path.parent.name,
                 "status": state.get("state") or "static",
+                "_jobShortId": state_path.parent.name,
                 "_staticJobStatePath": str(state_path),
                 "_linkScanPath": state.get("linkScanPath"),
             }
@@ -79,7 +80,10 @@ def merge_agents(live_agents, static_agents):
     for agent in live_agents:
         sid = agent.get("sessionId")
         if sid:
-            merged[sid] = agent
+            existing = merged.get(sid, {})
+            combined = dict(existing)
+            combined.update(agent)
+            merged[sid] = combined
     return list(merged.values())
 
 
@@ -94,7 +98,7 @@ def find_session_jsonl(config_dir, agent):
     link_scan = agent.get("_linkScanPath")
     if link_scan:
         link_path = Path(link_scan)
-        if link_path.exists() and link_path.is_file():
+        if is_within(link_path, config_dir) and link_path.exists() and link_path.is_file():
             return link_path
     candidates = []
     cwd = agent.get("cwd")
@@ -127,6 +131,25 @@ def copy_job_dir(source_config, target_config, short_id, force=False):
             dest, status = copy_file_preserve_rel(source_config, target_config, source_path, force=force)
             copied.append((dest, status))
     return copied, "copied"
+
+
+def rewrite_job_state_links(source_config, target_config, copied):
+    for dest, _status in copied:
+        if dest.name != "state.json" or not dest.exists():
+            continue
+        try:
+            state = json.loads(dest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        link_scan = state.get("linkScanPath")
+        if not link_scan:
+            continue
+        link_path = Path(link_scan)
+        if not is_within(link_path, source_config):
+            continue
+        rewritten = target_config / link_path.resolve().relative_to(source_config.resolve())
+        state["linkScanPath"] = str(rewritten)
+        dest.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def source_registry_path(target_config, source_config):
@@ -214,6 +237,34 @@ def replace_all_imported_context(target_config):
     except OSError:
         pass
     return removed
+
+
+def count_files(path):
+    if path.is_file() or path.is_symlink():
+        return 1
+    return sum(1 for item in path.rglob("*") if item.is_file() or item.is_symlink())
+
+
+def reset_target_static_context(target_config, stamp):
+    backup_dir = target_config / "backups" / f"freeze-import-reset-{stamp}"
+    moved = 0
+    removed_files = 0
+    for name in ("projects", "jobs", "freeze-import-registry"):
+        path = target_config / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dest = backup_dir / name
+        suffix = 1
+        while dest.exists():
+            suffix += 1
+            dest = backup_dir / f"{name}.{suffix}"
+        removed_files += count_files(path)
+        shutil.move(str(path), str(dest))
+        moved += 1
+    if moved == 0:
+        return 0, None
+    return removed_files, backup_dir
 
 
 def write_source_registry(target_config, source_config, imported):
@@ -305,6 +356,11 @@ def parse_args(argv):
         action="store_false",
         help="Keep previous freeze-imported context in the target config.",
     )
+    parser.add_argument(
+        "--reset-target-static",
+        action="store_true",
+        help="Move target projects/jobs/freeze-import-registry to a backup before importing.",
+    )
     parser.add_argument("--status", help="Comma-separated source agent status filter.")
     return parser.parse_args(argv)
 
@@ -317,7 +373,13 @@ def main(argv=None):
     out_dir = Path(args.output_dir or Path.home() / "claude-handoffs" / f"freeze-import-{args.target}-{stamp}").expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.replace_target:
+    if args.reset_target_static and source_config == target_config:
+        raise RuntimeError("--reset-target-static cannot be used when source and target are the same config")
+
+    reset_backup = None
+    if args.reset_target_static:
+        removed_previous, reset_backup = reset_target_static_context(target_config, stamp)
+    elif args.replace_target:
         removed_previous = replace_all_imported_context(target_config)
     else:
         removed_previous = replace_previous_source_import(target_config, source_config) if args.replace_source else 0
@@ -333,7 +395,7 @@ def main(argv=None):
         session_id = agent.get("sessionId")
         if not session_id:
             continue
-        short = session_id.split("-")[0]
+        short = agent.get("_jobShortId") or session_id.split("-")[0]
         session_path = find_session_jsonl(source_config, agent)
         session_dest = None
         session_status = "missing"
@@ -342,6 +404,7 @@ def main(argv=None):
                 source_config, target_config, session_path, force=args.force
             )
         job_copies, job_status = copy_job_dir(source_config, target_config, short, force=args.force)
+        rewrite_job_state_links(source_config, target_config, job_copies)
         imported.append(
             {
                 "agent": agent,
@@ -395,7 +458,9 @@ def main(argv=None):
         f"- status_filter: {','.join(sorted(statuses)) if statuses else '(none)'}",
         f"- replace_source: {args.replace_source}",
         f"- replace_target: {args.replace_target}",
+        f"- reset_target_static: {args.reset_target_static}",
         f"- removed_previous_files: {removed_previous}",
+        f"- target_static_backup: {reset_backup or '(none)'}",
         f"- registry: {registry}",
         f"- latest_marker: {marker}",
         "",
